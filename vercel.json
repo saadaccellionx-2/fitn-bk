@@ -1,0 +1,6 @@
+{
+  "version": 2,
+  "installCommand": "yarn install",
+  "buildCommand": "echo 'No build step required for JavaScript project'",
+  "framework": null
+}
