@@ -1,0 +1,601 @@
+name: Deploy to EC2
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: # manual trigger
+
+jobs:
+  build:
+    name: Build Application
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24.11.1"
+          cache: "npm"
+
+      - name: Verify Node.js and npm versions
+        run: |
+          echo "=== Verifying Node.js and npm versions ==="
+          NODE_VERSION=$(node --version)
+          NPM_VERSION=$(npm --version)
+          EXPECTED_NODE="v24.11.1"
+          
+          echo "Node.js version: ${NODE_VERSION}"
+          echo "npm version: ${NPM_VERSION}"
+          echo "Expected Node.js version: ${EXPECTED_NODE}"
+          
+          if [ "${NODE_VERSION}" != "${EXPECTED_NODE}" ]; then
+            echo "❌ ERROR: Node.js version mismatch!"
+            echo "   Expected: ${EXPECTED_NODE}"
+            echo "   Actual: ${NODE_VERSION}"
+            exit 1
+          fi
+          
+          if [ -z "${NPM_VERSION}" ]; then
+            echo "❌ ERROR: npm version could not be determined"
+            exit 1
+          fi
+          
+          echo "✅ Node.js and npm versions verified successfully"
+          echo ""
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build Application
+        run: npm run build
+
+      - name: Create deployment package (without node_modules)
+        run: |
+          mkdir -p deploy
+          # Copy backend application files
+          cp -r bin deploy/ 2>/dev/null || true
+          cp -r config deploy/ 2>/dev/null || true
+          cp -r helpers deploy/ 2>/dev/null || true
+          cp -r middleware deploy/ 2>/dev/null || true
+          cp -r models deploy/ 2>/dev/null || true
+          cp -r routes deploy/ 2>/dev/null || true
+          cp -r utils deploy/ 2>/dev/null || true
+          cp app.js deploy/ 2>/dev/null || true
+          # Copy dist if it exists (for frontend assets)
+          [ -d dist ] && cp -r dist deploy/ || echo "No dist directory found"
+          cp package*.json deploy/
+          cp ecosystem.config.cjs deploy/
+          # Copy .env.example if exists
+          [ -f .env.example ] && cp .env.example deploy/ || echo "No .env.example found"
+          tar -czf deploy.tar.gz -C deploy .
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-package
+          path: deploy.tar.gz
+          retention-days: 1
+
+  deploy:
+    name: Deploy to EC2
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: deployment-package
+
+      - name: Deploy to EC2 via SSH
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USERNAME: ${{ secrets.EC2_USERNAME }}
+          SSH_PRIVATE_KEY: ${{ secrets.EC2_SSH_KEY }}
+          PORT: ${{ secrets.PORT }}
+          HOST: ${{ secrets.HOST }}
+          DATABASE_URI: ${{ secrets.DATABASE_URI }}
+          STYTCH_PROJECT_ID: ${{ secrets.STYTCH_PROJECT_ID }}
+          STYTCH_SECRET: ${{ secrets.STYTCH_SECRET }}
+          STYTCH_ENVIRONMENT: ${{ secrets.STYTCH_ENVIRONMENT }}
+          STYTCH_AUTH_SESSION: ${{ secrets.STYTCH_AUTH_SESSION }}
+          AWS_ACCESS_KEY: ${{ secrets.AWS_ACCESS_KEY }}
+          AWS_SECRET_KEY: ${{ secrets.AWS_SECRET_KEY }}
+          AWS_SDK_LOAD_CONFIG: ${{ secrets.AWS_SDK_LOAD_CONFIG }}
+          JWT_SESSION_TIME: ${{ secrets.JWT_SESSION_TIME }}
+          JWT_SECRET_KEY: ${{ secrets.JWT_SECRET_KEY }}
+          JWT_REFRESH_SECRET_KEY: ${{ secrets.JWT_REFRESH_SECRET_KEY }}
+          ENV: ${{ secrets.ENV }}
+          CLOUD_FRONT_URL: ${{ secrets.CLOUD_FRONT_URL }}
+          CLOUD_NAME: ${{ secrets.CLOUD_NAME }}
+          API_KEY: ${{ secrets.API_KEY }}
+          API_SECRET: ${{ secrets.API_SECRET }}
+          RESET_URL_BASE: ${{ secrets.RESET_URL_BASE }}
+          REDIS_HOST: ${{ secrets.REDIS_HOST }}
+          REDIS_PORT: ${{ secrets.REDIS_PORT }}
+          REDIS_PASSWORD: ${{ secrets.REDIS_PASSWORD }}
+        run: |
+          # Create SSH key file (preserve newlines properly)
+          # Use printf to ensure newlines are preserved from the secret
+          printf '%s\n' "$SSH_PRIVATE_KEY" > private_key.pem
+          chmod 600 private_key.pem
+          
+          # Verify key format
+          echo "Verifying SSH key format..."
+          if ! grep -q "BEGIN.*PRIVATE KEY" private_key.pem; then
+            echo "❌ ERROR: SSH key appears to be missing proper headers"
+            echo "The key should start with '-----BEGIN' and end with '-----END'"
+            echo "First line: $(head -1 private_key.pem)"
+            echo "Last line: $(tail -1 private_key.pem)"
+            echo ""
+            echo "Please ensure EC2_SSH_KEY secret contains the complete private key including:"
+            echo "- -----BEGIN OPENSSH PRIVATE KEY----- (or similar)"
+            echo "- The key content"
+            echo "- -----END OPENSSH PRIVATE KEY----- (or similar)"
+            exit 1
+          fi
+          
+          echo "✅ SSH key format looks correct"
+
+          # Copy deployment package to EC2
+          scp -i private_key.pem -o StrictHostKeyChecking=no \
+            deploy.tar.gz ${EC2_USERNAME}@${EC2_HOST}:/tmp/
+
+          # Build .env file content
+          # Set Redis defaults if not provided (localhost, 6379, empty password)
+          REDIS_HOST_VAL="${REDIS_HOST:-localhost}"
+          REDIS_PORT_VAL="${REDIS_PORT:-6379}"
+          REDIS_PASSWORD_VAL="${REDIS_PASSWORD:-}"
+          
+          printf 'PORT=%s\nHOST=%s\nEC2_HOST=%s\nEC2_USERNAME=%s\nDATABASE_URI=%s\n\nSTYTCH_PROJECT_ID=%s\nSTYTCH_SECRET=%s\nSTYTCH_ENVIRONMENT=%s\nSTYTCH_AUTH_SESSION=%s\n\nAWS_ACCESS_KEY=%s\nAWS_SECRET_KEY=%s\nAWS_SDK_LOAD_CONFIG=%s\n\nJWT_SESSION_TIME=%s\nJWT_SECRET_KEY=%s\nJWT_REFRESH_SECRET_KEY=%s\nENV=%s\n\nCLOUD_FRONT_URL=%s\n\nCLOUD_NAME=%s\nAPI_KEY=%s\nAPI_SECRET=%s\n\nRESET_URL_BASE=%s\n\nREDIS_HOST=%s\nREDIS_PORT=%s\nREDIS_PASSWORD=%s\n' \
+            "${PORT}" "${HOST}" "${EC2_HOST}" "${EC2_USERNAME}" "${DATABASE_URI}" \
+            "${STYTCH_PROJECT_ID}" "${STYTCH_SECRET}" "${STYTCH_ENVIRONMENT}" "${STYTCH_AUTH_SESSION}" \
+            "${AWS_ACCESS_KEY}" "${AWS_SECRET_KEY}" "${AWS_SDK_LOAD_CONFIG}" \
+            "${JWT_SESSION_TIME}" "${JWT_SECRET_KEY}" "${JWT_REFRESH_SECRET_KEY}" "${ENV}" \
+            "${CLOUD_FRONT_URL}" \
+            "${CLOUD_NAME}" "${API_KEY}" "${API_SECRET}" \
+            "${RESET_URL_BASE}" \
+            "${REDIS_HOST_VAL}" "${REDIS_PORT_VAL}" "${REDIS_PASSWORD_VAL}" > /tmp/env_content
+
+          # Copy .env content to EC2
+          scp -i private_key.pem -o StrictHostKeyChecking=no \
+            /tmp/env_content ${EC2_USERNAME}@${EC2_HOST}:/tmp/env_content
+
+          # SSH into EC2 and deploy
+          ssh -i private_key.pem -o StrictHostKeyChecking=no \
+            ${EC2_USERNAME}@${EC2_HOST} << 'EOF'
+            
+            # Navigate to app directory
+            cd /var/www/fitn-bk
+
+            # Fix ownership first (important!)
+            echo "Fixing directory ownership..."
+            sudo chown -R $USER:$USER /var/www/fitn-bk
+            
+            
+            # Backup current version
+            if [ -d "dist" ]; then
+              timestamp=$(date +%Y%m%d_%H%M%S)
+              mkdir -p backups
+              tar -czf backups/backup_${timestamp}.tar.gz dist package.json ecosystem.config.cjs .env 2>/dev/null || true
+              # Keep only last 5 backups
+              ls -t backups/backup_*.tar.gz 2>/dev/null | tail -n +6 | xargs -r rm
+            fi
+            
+            # Extract new version (this will overwrite existing files)
+            echo "Extracting new deployment package..."
+            tar --overwrite -xzf /tmp/deploy.tar.gz -C /var/www/fitn-bk
+            rm /tmp/deploy.tar.gz
+
+            # Fix ownership after extraction
+            sudo chown -R $USER:$USER /var/www/fitn-bk
+            
+            # Verify Node.js and npm versions before installing dependencies
+            echo ""
+            echo "=== Verifying Node.js and npm versions on EC2 ==="
+            EXPECTED_NODE="v24.11.1"
+            
+            # Check if Node.js is installed
+            if ! command -v node &> /dev/null; then
+              echo "❌ ERROR: Node.js is not installed on the EC2 instance"
+              echo "Please install Node.js version ${EXPECTED_NODE} before deploying"
+              exit 1
+            fi
+            
+            # Check if npm is installed
+            if ! command -v npm &> /dev/null; then
+              echo "❌ ERROR: npm is not installed on the EC2 instance"
+              echo "Please install npm before deploying"
+              exit 1
+            fi
+            
+            # Get actual versions
+            ACTUAL_NODE=$(node --version)
+            ACTUAL_NPM=$(npm --version)
+            
+            echo "Expected Node.js version: ${EXPECTED_NODE}"
+            echo "Actual Node.js version: ${ACTUAL_NODE}"
+            echo "npm version: ${ACTUAL_NPM}"
+            
+            # Verify Node.js version matches
+            if [ "${ACTUAL_NODE}" != "${EXPECTED_NODE}" ]; then
+              echo ""
+              echo "❌ ERROR: Node.js version mismatch!"
+              echo "   Expected: ${EXPECTED_NODE}"
+              echo "   Actual: ${ACTUAL_NODE}"
+              echo ""
+              echo "Please install Node.js version ${EXPECTED_NODE} on the EC2 instance."
+              echo "You can use nvm (Node Version Manager) to install it:"
+              echo "   curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.0/install.sh | bash"
+              echo "   source ~/.bashrc"
+              echo "   nvm install ${EXPECTED_NODE}"
+              echo "   nvm use ${EXPECTED_NODE}"
+              echo "   nvm alias default ${EXPECTED_NODE}"
+              exit 1
+            fi
+            
+            # Verify npm version is reasonable (should be compatible with Node.js 24.11.1)
+            if [ -z "${ACTUAL_NPM}" ]; then
+              echo "❌ ERROR: npm version could not be determined"
+              exit 1
+            fi
+            
+            echo ""
+            echo "✅ Node.js and npm versions verified successfully"
+            echo ""
+            
+            # Install production dependencies on the server
+            echo "Installing production dependencies..."
+            npm ci
+            
+            # Create .env file with all required secrets
+            echo "Creating .env file from secrets..."
+            mv /tmp/env_content .env
+            echo ".env file created successfully"
+            
+            # Create logs directory
+            mkdir -p logs
+            
+            # Restart PM2 process while maintaining process ID
+            # Use reload for zero-downtime, fallback to restart if reload fails
+            if sudo pm2 describe fitn-bk > /dev/null 2>&1; then
+              echo "PM2 process 'fitn-bk' exists, attempting reload (zero-downtime)..."
+              if sudo pm2 reload fitn-bk --update-env; then
+                echo "✅ PM2 process reloaded successfully (maintaining process ID)"
+              else
+                echo "⚠️  Reload failed, attempting restart..."
+                if sudo pm2 restart fitn-bk --update-env; then
+                  echo "✅ PM2 process restarted successfully (maintaining process ID)"
+                else
+                  echo "❌ Restart failed, deleting and starting fresh..."
+                  sudo pm2 delete fitn-bk || true
+                  sudo pm2 start ecosystem.config.cjs
+                fi
+              fi
+            else
+              echo "PM2 process 'fitn-bk' does not exist, starting new process..."
+              sudo pm2 start ecosystem.config.cjs
+            fi
+            
+            # Verify .env file and show port configuration
+            echo ""
+            echo "Checking .env file configuration..."
+            if [ -f .env ]; then
+              ENV_PORT=$(grep '^PORT=' .env | cut -d'=' -f2 || echo 'not set')
+              ENV_HOST=$(grep '^HOST=' .env | cut -d'=' -f2 || echo 'not set')
+              echo "PORT from .env: ${ENV_PORT}"
+              echo "HOST from .env: ${ENV_HOST}"
+              
+              # Warn if HOST is localhost (backend should listen on 0.0.0.0)
+              if [ "${ENV_HOST}" = "localhost" ] || [ "${ENV_HOST}" = "127.0.0.1" ] || [ -z "${ENV_HOST}" ] || [ "${ENV_HOST}" = "not set" ]; then
+                echo ""
+                echo "⚠️  WARNING: HOST is set to '${ENV_HOST}' or not set."
+                echo "   For a backend API, HOST should be '0.0.0.0' to accept external connections."
+                echo "   The app may not be accessible from outside the server."
+              fi
+            else
+              echo "Warning: .env file not found!"
+            fi
+            
+            # Verify ecosystem.config.cjs is correct
+            echo ""
+            echo "Verifying ecosystem.config.cjs..."
+            if [ -f ecosystem.config.cjs ]; then
+              echo "ecosystem.config.cjs exists"
+              echo "Script path in config: $(grep -A 2 'script:' ecosystem.config.cjs | head -2 | tail -1 | sed 's/.*script.*:.*"\(.*\)".*/\1/' || echo 'not found')"
+            else
+              echo "ERROR: ecosystem.config.cjs not found!"
+            fi
+            
+            # Wait a bit and check if process is running
+            sleep 5
+            if ! sudo pm2 describe fitn-bk > /dev/null 2>&1; then
+              echo "❌ ERROR: PM2 process did not start or is not running!"
+              echo "Checking for errors..."
+              sudo pm2 logs fitn-bk --err --lines 20 --nostream || echo "No error logs available"
+              exit 1
+            fi
+            
+            # Check process status
+            PM2_STATUS=$(sudo pm2 describe fitn-bk 2>/dev/null | grep -oP 'status.*:\s*\K\w+' | head -1 || echo "unknown")
+            if [ "$PM2_STATUS" != "online" ]; then
+              echo "⚠️  WARNING: PM2 process status is '$PM2_STATUS', not 'online'"
+              echo "Checking error logs..."
+              sudo pm2 logs fitn-bk --err --lines 30 --nostream || echo "No error logs available"
+              if [ "$PM2_STATUS" = "errored" ] || [ "$PM2_STATUS" = "stopped" ]; then
+                echo "❌ ERROR: PM2 process is in error state!"
+                exit 1
+              fi
+            else
+              echo "✅ PM2 process is online"
+            fi
+            
+            # Wait a moment for the app to start
+            sleep 3
+            
+            # Save PM2 process list
+            sudo pm2 save
+            
+            # Configure PM2 to start on system boot (if not already configured)
+            echo ""
+            echo "Configuring PM2 startup script..."
+            if ! sudo pm2 startup | grep -q "already setup"; then
+              # Get the startup command from pm2 startup output
+              STARTUP_CMD=$(sudo pm2 startup | grep -E "sudo|pm2" | tail -1)
+              if [ -n "$STARTUP_CMD" ]; then
+                echo "Running PM2 startup command..."
+                eval "$STARTUP_CMD" || echo "⚠️  Startup script may already be configured"
+              fi
+            else
+              echo "✅ PM2 startup script already configured"
+            fi
+            
+            # Show PM2 status
+            echo ""
+            echo "PM2 Status:"
+            sudo pm2 status
+            
+            # Show recent logs
+            echo ""
+            echo "Recent PM2 logs (last 20 lines):"
+            sudo pm2 logs fitn-bk --lines 20 --nostream || echo "Could not retrieve logs"
+           
+          EOF
+
+          # Cleanup
+          rm private_key.pem
+          rm -f /tmp/env_content
+
+      - name: Verify deployment
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USERNAME: ${{ secrets.EC2_USERNAME }}
+          SSH_PRIVATE_KEY: ${{ secrets.EC2_SSH_KEY }}
+        run: |
+          echo "Waiting for application to start..."
+          sleep 10
+
+          # Create SSH key file for verification
+          printf '%s\n' "$SSH_PRIVATE_KEY" > private_key.pem
+          chmod 600 private_key.pem
+
+          # First, verify PM2 process is running and healthy
+          echo "=== Step 1: Verifying PM2 process health ==="
+          PM2_CHECK=$(ssh -i private_key.pem -o StrictHostKeyChecking=no ${EC2_USERNAME}@${EC2_HOST} 'sudo pm2 describe fitn-bk 2>/dev/null | grep -q "status.*online" && echo "online" || echo "offline"')
+          
+          if [ "$PM2_CHECK" != "online" ]; then
+            echo "❌ PM2 process is not online"
+            ssh -i private_key.pem -o StrictHostKeyChecking=no \
+              ${EC2_USERNAME}@${EC2_HOST} << 'EOF'
+              echo "=== PM2 Status ==="
+              sudo pm2 status || echo "PM2 not running or accessible"
+              echo ""
+              echo "=== PM2 Process Info ==="
+              sudo pm2 describe fitn-bk || echo "Process 'fitn-bk' not found"
+              echo ""
+              echo "=== Recent Error Logs ==="
+              sudo pm2 logs fitn-bk --err --lines 30 --nostream 2>/dev/null || echo "Could not retrieve error logs"
+          EOF
+            rm private_key.pem
+            exit 1
+          fi
+          echo "✅ PM2 process is online"
+
+          # Check if app is listening on port
+          echo ""
+          echo "=== Step 2: Verifying app is listening on port ==="
+          PORT_CHECK_RESULT=$(ssh -i private_key.pem -o StrictHostKeyChecking=no ${EC2_USERNAME}@${EC2_HOST} 'APP_PORT=$(grep "^PORT=" /var/www/fitn-bk/.env 2>/dev/null | cut -d"=" -f2 || echo "8000"); if (ss -tlnp 2>/dev/null || netstat -tlnp 2>/dev/null) | grep -q ":${APP_PORT}"; then echo "listening:${APP_PORT}"; else echo "not_listening:${APP_PORT}"; fi')
+          
+          PORT_STATUS=$(echo "$PORT_CHECK_RESULT" | cut -d":" -f1)
+          APP_PORT=$(echo "$PORT_CHECK_RESULT" | cut -d":" -f2)
+          
+          if [ "$PORT_STATUS" != "listening" ]; then
+            echo "⚠️  App may not be listening on port ${APP_PORT}, but continuing verification..."
+          else
+            echo "✅ App is listening on port ${APP_PORT}"
+          fi
+
+          # Check for "Listening at" message in logs
+          echo ""
+          echo "=== Step 3: Checking for 'Listening at' message in logs ==="
+          LISTENING_MSG=$(ssh -i private_key.pem -o StrictHostKeyChecking=no ${EC2_USERNAME}@${EC2_HOST} 'sudo pm2 logs fitn-bk --lines 50 --nostream 2>/dev/null | grep -i "listening at" | tail -1 || echo ""')
+          
+          if [ -n "$LISTENING_MSG" ]; then
+            echo "✅ Found listening message: ${LISTENING_MSG}"
+          else
+            echo "⚠️  No 'Listening at' message found in recent logs, but PM2 shows process is online"
+          fi
+
+          # Check HTTP response (accept 200, 301, 302, 403, 404 as valid responses)
+          # 403 = Forbidden (server is running but access denied - valid for protected endpoints)
+          # 404 = Not Found (server is running but route doesn't exist - still means server is up)
+          echo ""
+          echo "=== Step 4: Checking HTTP response ==="
+          DEPLOYMENT_SUCCESS=false
+          
+          for i in {1..3}; do
+            echo "HTTP check attempt $i of 3..."
+            response=$(curl -s -o /dev/null -w "%{http_code}" http://${EC2_HOST} 2>/dev/null || echo "000")
+            
+            echo "Got HTTP response: $response"
+            
+            # Accept multiple status codes as success indicators
+            # 200 = OK
+            # 301/302 = Redirects (server is running)
+            # 403 = Forbidden (server is running, access denied - common for protected APIs)
+            # 404 = Not Found (server is running, route doesn't exist)
+            # 500 = Internal Server Error (server is running but has errors - we'll check logs)
+            if [ "$response" = "200" ] || [ "$response" = "301" ] || [ "$response" = "302" ] || [ "$response" = "403" ] || [ "$response" = "404" ]; then
+              echo "✅ Deployment successful! Server is responding with HTTP status: $response"
+              if [ "$response" = "403" ]; then
+                echo "   Note: 403 Forbidden indicates the server is running but access is restricted (expected for protected endpoints)"
+              elif [ "$response" = "404" ]; then
+                echo "   Note: 404 Not Found indicates the server is running but the route doesn't exist (server is up)"
+              fi
+              DEPLOYMENT_SUCCESS=true
+              break
+            elif [ "$response" = "500" ]; then
+              echo "⚠️  Got 500 Internal Server Error - server is running but has errors"
+              echo "   This may indicate a deployment issue, but server is up"
+              # Don't break, continue checking
+            fi
+            
+            if [ $i -lt 3 ]; then
+              echo "Waiting 5 seconds before next attempt..."
+              sleep 5
+            fi
+          done
+
+          if [ "$DEPLOYMENT_SUCCESS" = true ]; then
+            echo ""
+            echo "=== Deployment Verification Summary ==="
+            echo "✅ PM2 process: Online"
+            echo "✅ Port listening: ${PORT_STATUS} (port ${APP_PORT})"
+            echo "✅ HTTP response: Server responding"
+            echo ""
+            echo "🎉 Deployment verified successfully!"
+            rm private_key.pem
+            exit 0
+          fi
+
+          # If we get here, HTTP check failed but PM2 is online
+          # Check if PM2 shows the process is healthy
+          echo ""
+          echo "⚠️  HTTP check did not return expected status codes"
+          echo "However, PM2 shows the process is online. Checking detailed status..."
+          
+          # Final verification: if PM2 is online and app is listening, consider it successful
+          if [ "$PM2_CHECK" = "online" ] && [ -n "$LISTENING_MSG" ]; then
+            echo ""
+            echo "✅ Alternative verification passed:"
+            echo "   - PM2 process is online"
+            echo "   - App has 'Listening at' message in logs"
+            echo ""
+            echo "🎉 Deployment verified successfully (via PM2 and logs check)!"
+            rm private_key.pem
+            exit 0
+          fi
+
+          # If all checks fail, show detailed diagnostics
+          echo ""
+          echo "❌ Deployment verification failed"
+          echo "Checking detailed diagnostics..."
+          
+          ssh -i private_key.pem -o StrictHostKeyChecking=no \
+            ${EC2_USERNAME}@${EC2_HOST} << 'EOF'
+            echo "=== PM2 Status ==="
+            sudo pm2 status || echo "PM2 not running or accessible"
+            echo ""
+            echo "=== PM2 Process Info ==="
+            sudo pm2 describe fitn-bk || echo "Process 'fitn-bk' not found"
+            echo ""
+            echo "=== Recent Error Logs (last 30 lines) ==="
+            sudo pm2 logs fitn-bk --err --lines 30 --nostream 2>/dev/null || echo "Could not retrieve error logs"
+            echo ""
+            echo "=== Recent Output Logs (last 30 lines) ==="
+            sudo pm2 logs fitn-bk --out --lines 30 --nostream 2>/dev/null || echo "Could not retrieve output logs"
+            echo ""
+            echo "=== Checking .env file ==="
+            if [ -f /var/www/fitn-bk/.env ]; then
+              ls -la /var/www/fitn-bk/.env
+              echo ""
+              echo "PORT from .env: $(grep '^PORT=' /var/www/fitn-bk/.env | cut -d'=' -f2 || echo 'not set')"
+              echo "HOST from .env: $(grep '^HOST=' /var/www/fitn-bk/.env | cut -d'=' -f2 || echo 'not set')"
+            else
+              echo ".env file not found"
+            fi
+            echo ""
+            echo "=== Checking if app is listening on ports ==="
+            APP_PORT=$(grep '^PORT=' /var/www/fitn-bk/.env 2>/dev/null | cut -d'=' -f2 || echo "8000")
+            echo "Checking port ${APP_PORT} (from .env) and common ports (8000, 11000)..."
+            (ss -tlnp 2>/dev/null || netstat -tlnp 2>/dev/null) | grep -E ":(8000|11000|${APP_PORT})" || echo "No process listening on ports 8000, 11000, or ${APP_PORT}"
+            echo ""
+            echo "=== Checking for 'Listening at' message in logs ==="
+            sudo pm2 logs fitn-bk --lines 50 --nostream 2>/dev/null | grep -i "listening" || echo "No 'Listening' message found in logs"
+          EOF
+          
+          rm private_key.pem
+          exit 1
+
+      - name: Rollback on failure
+        if: failure()
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USERNAME: ${{ secrets.EC2_USERNAME }}
+          SSH_PRIVATE_KEY: ${{ secrets.EC2_SSH_KEY }}
+        run: |
+          echo "🔄 Attempting to rollback to previous version..."
+
+          echo "$SSH_PRIVATE_KEY" > private_key.pem
+          chmod 600 private_key.pem
+
+          ssh -i private_key.pem -o StrictHostKeyChecking=no \
+            ${EC2_USERNAME}@${EC2_HOST} << 'EOF'
+            
+            cd /var/www/fitn-bk
+
+            # Fix ownership first (important!)
+            sudo chown -R $USER:$USER /var/www/fitn-bk
+            
+            # Verify Node.js and npm versions before rollback
+            echo "=== Verifying Node.js and npm versions before rollback ==="
+            EXPECTED_NODE="v24.11.1"
+            
+            if ! command -v node &> /dev/null || ! command -v npm &> /dev/null; then
+              echo "❌ ERROR: Node.js or npm not found. Cannot proceed with rollback."
+              exit 1
+            fi
+            
+            ACTUAL_NODE=$(node --version)
+            ACTUAL_NPM=$(npm --version)
+            
+            echo "Expected Node.js version: ${EXPECTED_NODE}"
+            echo "Actual Node.js version: ${ACTUAL_NODE}"
+            echo "npm version: ${ACTUAL_NPM}"
+            
+            if [ "${ACTUAL_NODE}" != "${EXPECTED_NODE}" ]; then
+              echo "⚠️  WARNING: Node.js version mismatch (${ACTUAL_NODE} vs ${EXPECTED_NODE})"
+              echo "   Rollback may fail or produce unexpected results"
+            else
+              echo "✅ Version check passed"
+            fi
+            echo ""
+            
+            # Find latest backup
+            latest_backup=$(ls -t backups/backup_*.tar.gz 2>/dev/null | head -1)
+            
+            if [ -n "$latest_backup" ]; then
+              echo "Found backup: $latest_backup"
+              tar -xzf "$latest_backup" -C /var/www/fitn-bk
+              npm ci
+              pm2 reload ecosystem.config.cjs
+              echo "✅ Rolled back to previous version"
+            else
+              echo "⚠️ No backup found, cannot rollback"
+            fi
+          EOF
+
+          rm private_key.pem
